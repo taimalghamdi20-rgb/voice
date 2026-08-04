@@ -1,8 +1,72 @@
-// ... (نفس الإعدادات الأولى) ...
+// ===== استيراد المكتبات =====
+const {
+  Client,
+  GatewayIntentBits,
+  Events,
+  EmbedBuilder,
+  AttachmentBuilder,
+} = require('discord.js');
+const {
+  joinVoiceChannel,
+  getVoiceConnection,
+  VoiceConnectionStatus,
+  entersState,
+  EndBehaviorType,
+} = require('@discordjs/voice');
+const prism = require('prism-media');
+const { spawn } = require('child_process');
+const fs = require('fs').promises;
+const fsSync = require('fs');
+const path = require('path');
+const ffmpeg = require('ffmpeg-static');
 
-// ===== متغير لتتبع محاولة الاتصال =====
-let connectingAttempt = false;
+// ===== قراءة المتغيرات البيئية =====
+const {
+  BOT_TOKEN,
+  GUILD_ID,
+  RECORDING_CHANNEL,        // اسم المتغير كما في Render
+  TRANSCRIPT_CHANNEL_ID,
+} = process.env;
 
+if (!BOT_TOKEN || !GUILD_ID || !RECORDING_CHANNEL || !TRANSCRIPT_CHANNEL_ID) {
+  console.error('❌ تأكد من تعبئة جميع المتغيرات:');
+  console.error('   BOT_TOKEN, GUILD_ID, RECORDING_CHANNEL, TRANSCRIPT_CHANNEL_ID');
+  process.exit(1);
+}
+
+// ===== إعدادات البوت =====
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildVoiceStates,
+    GatewayIntentBits.GuildMessages,
+  ],
+});
+
+// ===== مجلد الملفات المؤقتة =====
+const TEMP_DIR = path.join(__dirname, 'temp_audio');
+if (!fsSync.existsSync(TEMP_DIR)) {
+  fsSync.mkdirSync(TEMP_DIR, { recursive: true });
+}
+
+// ===== حالة البوت =====
+let isRecording = false;
+let connectingAttempt = false;    // منع المحاولات المتزامنة
+let recordingData = null;        // تخزين بيانات التسجيل
+
+// ===== تنظيف الملفات المؤقتة =====
+async function cleanTempFiles() {
+  try {
+    const files = await fs.readdir(TEMP_DIR);
+    for (const file of files) {
+      await fs.unlink(path.join(TEMP_DIR, file)).catch(() => {});
+    }
+  } catch (e) {
+    // تجاهل
+  }
+}
+
+// ===== بدء التسجيل =====
 async function startRecording(guild, voiceChannel) {
   if (isRecording) return;
   if (connectingAttempt) {
@@ -28,7 +92,7 @@ async function startRecording(guild, voiceChannel) {
     guildId: guild.id,
     adapterCreator: guild.voiceAdapterCreator,
     selfDeaf: false,
-    selfMute: true
+    selfMute: true,
   });
 
   // معالجة أحداث الاتصال
@@ -47,7 +111,7 @@ async function startRecording(guild, voiceChannel) {
   });
 
   try {
-    // زيادة المهلة إلى 30 ثانية
+    // انتظار جاهزية الاتصال (مهلة 30 ثانية)
     await entersState(connection, VoiceConnectionStatus.Ready, 30_000);
     console.log(`✅ متصل بالروم: ${voiceChannel.name}`);
   } catch (err) {
@@ -64,27 +128,95 @@ async function startRecording(guild, voiceChannel) {
     return;
   }
 
-  // ... باقي الكود (إنشاء التدفقات، التسجيل، إلخ) ...
-  // (نفس الكود السابق من هنا)
+  // ===== إنشاء ملفات التسجيل =====
+  const timestamp = Date.now();
+  const pcmPath = path.join(TEMP_DIR, `rec_${timestamp}.pcm`);
+  const mp3Path = path.join(TEMP_DIR, `rec_${timestamp}.mp3`);
+  const pcmStream = fsSync.createWriteStream(pcmPath);
 
-  // عند الانتهاء بنجاح، نعيد تعيين connectingAttempt
+  // ===== الاشتراك في تدفقات الصوت =====
+  const receiver = connection.receiver;
+  const userIds = voiceChannel.members.map(m => m.id);
+  const subscriptions = [];
+
+  for (const userId of userIds) {
+    if (userId === client.user.id) continue; // نتجنب تسجيل البوت نفسه
+    const audioStream = receiver.subscribe(userId, {
+      end: { behavior: EndBehaviorType.AfterSilence },
+    });
+    if (!audioStream) continue;
+
+    const decoder = new prism.opus.Decoder({
+      rate: 48000,
+      channels: 2,
+      frameSize: 960,
+    });
+    const pipeline = audioStream.pipe(decoder).pipe(pcmStream);
+    subscriptions.push({ userId, audioStream, decoder, pipeline });
+  }
+
+  // ===== الاستماع للأعضاء الجدد الذين يدخلون أثناء التسجيل =====
+  const voiceStateUpdateHandler = (oldState, newState) => {
+    if (newState.channelId === voiceChannel.id && oldState.channelId !== voiceChannel.id) {
+      const userId = newState.id;
+      if (userId === client.user.id) return;
+      if (subscriptions.some(s => s.userId === userId)) return;
+
+      const audioStream = receiver.subscribe(userId, {
+        end: { behavior: EndBehaviorType.AfterSilence },
+      });
+      if (!audioStream) return;
+
+      const decoder = new prism.opus.Decoder({
+        rate: 48000,
+        channels: 2,
+        frameSize: 960,
+      });
+      const pipeline = audioStream.pipe(decoder).pipe(pcmStream);
+      subscriptions.push({ userId, audioStream, decoder, pipeline });
+      console.log(`➕ تم إضافة المستخدم ${userId} للتسجيل.`);
+    }
+  };
+
+  client.on(Events.VoiceStateUpdate, voiceStateUpdateHandler);
+
+  // ===== حفظ بيانات الجلسة =====
+  recordingData = {
+    pcmPath,
+    mp3Path,
+    pcmStream,
+    subscriptions,
+    connection,
+    voiceStateUpdateHandler,
+    startTime: Date.now(),
+  };
+
+  isRecording = true;
   connectingAttempt = false;
+  console.log('🎙️ بدأ التسجيل في الروم.');
 }
 
-// ===== تعديل دالة stopAndSendRecording =====
-// التأكد من تدمير الاتصال فقط إذا كان موجوداً ولم يدمّر
+// ===== إيقاف التسجيل وتحويل الصوت وإرساله =====
 async function stopAndSendRecording(guild) {
-  if (!isRecording || !recordingData) return;
+  if (!isRecording || !recordingData) {
+    console.log('⚠️ لا يوجد تسجيل نشط.');
+    return;
+  }
 
   const {
-    pcmPath, mp3Path, pcmStream, subscriptions,
-    connection, voiceStateUpdateHandler, startTime
+    pcmPath,
+    mp3Path,
+    pcmStream,
+    subscriptions,
+    connection,
+    voiceStateUpdateHandler,
+    startTime,
   } = recordingData;
 
-  // إلغاء الاشتراك من الأحداث
+  // إلغاء الاشتراك من حدث VoiceStateUpdate
   client.off(Events.VoiceStateUpdate, voiceStateUpdateHandler);
 
-  // إغلاق التدفقات
+  // إغلاق جميع التدفقات
   for (const sub of subscriptions) {
     try { sub.audioStream.destroy(); } catch (e) {}
     try { sub.decoder.destroy(); } catch (e) {}
@@ -92,7 +224,7 @@ async function stopAndSendRecording(guild) {
   }
   try { pcmStream.close(); } catch (e) {}
 
-  // تدمير الاتصال إذا كان موجوداً ولم يدمّر
+  // تدمير الاتصال إذا كان موجوداً
   if (connection && connection.state.status !== VoiceConnectionStatus.Destroyed) {
     try {
       connection.destroy();
@@ -101,15 +233,83 @@ async function stopAndSendRecording(guild) {
     }
   }
 
+  // إعادة تعيين الحالة
   isRecording = false;
   recordingData = null;
   connectingAttempt = false;
 
-  // ... باقي الكود (تحويل الصوت وإرساله) ...
-  // (نفس الكود السابق)
+  // التحقق من وجود ملف PCM
+  try {
+    await fs.access(pcmPath);
+  } catch {
+    console.log('⚠️ لا يوجد ملف PCM للتسجيل.');
+    await cleanTempFiles();
+    return;
+  }
+
+  // ===== تحويل PCM إلى MP3 باستخدام ffmpeg =====
+  console.log('🔄 جاري تحويل الصوت إلى MP3...');
+  try {
+    await new Promise((resolve, reject) => {
+      const ffmpegProcess = spawn(ffmpeg, [
+        '-f', 's16le',
+        '-ar', '48000',
+        '-ac', '2',
+        '-i', pcmPath,
+        '-acodec', 'libmp3lame',
+        '-ab', '64k',
+        '-y',
+        mp3Path,
+      ]);
+      ffmpegProcess.on('close', (code) => {
+        if (code === 0) resolve();
+        else reject(new Error(`ffmpeg خرج بـ ${code}`));
+      });
+      ffmpegProcess.on('error', reject);
+    });
+  } catch (err) {
+    console.error('❌ فشل تحويل الصوت:', err);
+    await cleanTempFiles();
+    return;
+  }
+
+  // حذف ملف PCM
+  await fs.unlink(pcmPath).catch(() => {});
+
+  // ===== حساب المدة =====
+  const duration = Math.floor((Date.now() - startTime) / 1000);
+  const mins = Math.floor(duration / 60);
+  const secs = duration % 60;
+  const durationText = mins > 0 ? `${mins} دقيقة و ${secs} ثانية` : `${secs} ثانية`;
+
+  // ===== إرسال الملف إلى قناة النصوص =====
+  const transcriptChannel = guild.channels.cache.get(TRANSCRIPT_CHANNEL_ID);
+  if (transcriptChannel && transcriptChannel.isTextBased()) {
+    const embed = new EmbedBuilder()
+      .setColor(0x00ff88)
+      .setTitle('🎙️ تسجيل مكالمة صوتية')
+      .addFields(
+        { name: 'المدة', value: durationText, inline: true },
+        { name: 'الروم', value: `<#${RECORDING_CHANNEL}>`, inline: true },
+      )
+      .setTimestamp();
+
+    const attachment = new AttachmentBuilder(mp3Path, { name: `recording_${Date.now()}.mp3` });
+    await transcriptChannel.send({
+      embeds: [embed],
+      files: [attachment],
+    });
+    console.log('✅ تم إرسال الملف الصوتي إلى قناة النصوص.');
+  } else {
+    console.error('❌ قناة النصوص غير موجودة أو غير صالحة.');
+  }
+
+  // حذف ملف MP3 بعد الإرسال
+  await fs.unlink(mp3Path).catch(() => {});
+  await cleanTempFiles();
 }
 
-// ===== تعديل حدث VoiceStateUpdate لتجنب المحاولات المتكررة =====
+// ===== مراقبة دخول/خروج الأعضاء =====
 client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
   const guild = newState.guild || oldState.guild;
   if (!guild || guild.id !== GUILD_ID) return;
@@ -117,6 +317,7 @@ client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
   const voiceChannel = guild.channels.cache.get(RECORDING_CHANNEL);
   if (!voiceChannel || voiceChannel.type !== 2) return;
 
+  // التحقق من وجود بشر (غير البوت) في الروم
   const members = voiceChannel.members.filter(m => !m.user.bot);
   const hasHumans = members.size > 0;
 
@@ -127,7 +328,7 @@ client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
   }
 });
 
-// ===== في ClientReady =====
+// ===== عند تشغيل البوت =====
 client.once(Events.ClientReady, async (c) => {
   console.log(`🤖 البوت شغال باسم ${c.user.tag}`);
   const guild = c.guilds.cache.get(GUILD_ID);
@@ -137,6 +338,7 @@ client.once(Events.ClientReady, async (c) => {
   }
 
   await cleanTempFiles();
+
   const voiceChannel = guild.channels.cache.get(RECORDING_CHANNEL);
   if (voiceChannel && voiceChannel.type === 2) {
     const members = voiceChannel.members.filter(m => !m.user.bot);
@@ -149,3 +351,14 @@ client.once(Events.ClientReady, async (c) => {
     console.error('❌ الروم الصوتي المحدد غير موجود أو ليس صوتياً.');
   }
 });
+
+// ===== معالجة الأخطاء غير المتوقعة =====
+process.on('unhandledRejection', (reason) => {
+  console.error('⚠️ Unhandled Rejection:', reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('⚠️ Uncaught Exception:', err);
+});
+
+// ===== تشغيل البوت =====
+client.login(BOT_TOKEN);
