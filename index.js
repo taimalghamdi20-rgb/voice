@@ -20,7 +20,7 @@ const fsSync = require('fs');
 const path = require('path');
 const ffmpeg = require('ffmpeg-static');
 
-// ===== قراءة المتغيرات البيئية =====
+// ===== المتغيرات البيئية =====
 const {
   BOT_TOKEN,
   GUILD_ID,
@@ -65,18 +65,51 @@ async function cleanTempFiles() {
 }
 
 // ===== دالة انتظار جاهزية الاتصال مع إعادة المحاولة =====
-async function waitForReady(connection, timeout = 60000) {
-  const start = Date.now();
-  while (Date.now() - start < timeout) {
-    const status = connection.state.status;
-    if (status === VoiceConnectionStatus.Ready) return true;
-    if (status === VoiceConnectionStatus.Destroyed || status === VoiceConnectionStatus.Disconnected) {
-      return false;
-    }
-    // انتظر 500 مللي ثم تحقق مجدداً
-    await new Promise(resolve => setTimeout(resolve, 500));
+async function waitForVoiceConnection(connection, timeout = 60000) {
+  try {
+    await entersState(connection, VoiceConnectionStatus.Ready, timeout);
+    return true;
+  } catch (err) {
+    console.error(`⚠️ فشل انتظار الجاهزية: ${err.message}`);
+    return false;
   }
-  return false;
+}
+
+// ===== دالة الاشتراك في صوت المستخدمين مع إعادة المحاولة =====
+async function subscribeToUsers(receiver, userIds, pcmStream, retries = 2) {
+  const subscriptions = [];
+  for (const userId of userIds) {
+    if (userId === client.user.id) continue;
+    let success = false;
+    for (let attempt = 1; attempt <= retries; attempt++) {
+      try {
+        const audioStream = receiver.subscribe(userId, {
+          end: { behavior: EndBehaviorType.AfterSilence },
+        });
+        if (audioStream) {
+          const decoder = new prism.opus.Decoder({
+            rate: 48000,
+            channels: 2,
+            frameSize: 960,
+          });
+          const pipeline = audioStream.pipe(decoder).pipe(pcmStream);
+          subscriptions.push({ userId, audioStream, decoder, pipeline });
+          console.log(`✅ تم الاشتراك في المستخدم ${userId} (محاولة ${attempt})`);
+          success = true;
+          break;
+        }
+      } catch (err) {
+        console.warn(`⚠️ فشل الاشتراك في ${userId} (محاولة ${attempt}): ${err.message}`);
+        if (attempt < retries) {
+          await new Promise(resolve => setTimeout(resolve, 1000));
+        }
+      }
+    }
+    if (!success) {
+      console.warn(`❌ تعذر الاشتراك في المستخدم ${userId} بعد ${retries} محاولات.`);
+    }
+  }
+  return subscriptions;
 }
 
 // ===== بدء التسجيل =====
@@ -89,15 +122,11 @@ async function startRecording(guild, voiceChannel) {
 
   connectingAttempt = true;
 
-  // التأكد من عدم وجود اتصال مسبق
+  // حذف اتصال سابق إن وجد
   const existingConnection = getVoiceConnection(guild.id);
   if (existingConnection) {
-    console.log('⚠️ يوجد اتصال صوتي مسبق، سيتم تدميره.');
-    try {
-      existingConnection.destroy();
-    } catch (e) {
-      console.log('⚠️ فشل تدمير الاتصال المسبق:', e.message);
-    }
+    console.log('⚠️ يوجد اتصال مسبق، سيتم تدميره.');
+    try { existingConnection.destroy(); } catch (e) {}
   }
 
   const connection = joinVoiceChannel({
@@ -108,12 +137,11 @@ async function startRecording(guild, voiceChannel) {
     selfMute: true,
   });
 
-  // رفع حد المستمعين
   connection.setMaxListeners(20);
 
-  // تعريف المستمعين
+  // مستمعي الأحداث
   const onError = (error) => {
-    console.error('🔴 خطأ في الاتصال الصوتي:', error);
+    console.error('🔴 خطأ في الاتصال:', error);
   };
   const onDisconnected = async () => {
     console.log('🔌 انقطع الاتصال، جاري إعادة المحاولة...');
@@ -128,11 +156,11 @@ async function startRecording(guild, voiceChannel) {
   connection.on('error', onError);
   connection.on(VoiceConnectionStatus.Disconnected, onDisconnected);
 
-  // انتظار الجاهزية مع مهلة طويلة
+  // انتظار الجاهزية
   console.log('⏳ جاري الاتصال بالروم الصوتي...');
-  const ready = await waitForReady(connection, 60000);
+  const ready = await waitForVoiceConnection(connection, 60000);
   if (!ready) {
-    console.error('❌ فشل الاتصال: لم يصبح جاهزاً خلال المهلة.');
+    console.error('❌ فشل الاتصال بسبب المهلة.');
     try {
       connection.off('error', onError);
       connection.off(VoiceConnectionStatus.Disconnected, onDisconnected);
@@ -144,17 +172,13 @@ async function startRecording(guild, voiceChannel) {
 
   console.log(`✅ متصل بالروم: ${voiceChannel.name}`);
 
-  // ===== إنشاء ملفات التسجيل =====
+  // إنشاء ملفات التسجيل
   const timestamp = Date.now();
   const pcmPath = path.join(TEMP_DIR, `rec_${timestamp}.pcm`);
   const mp3Path = path.join(TEMP_DIR, `rec_${timestamp}.mp3`);
   const pcmStream = fsSync.createWriteStream(pcmPath);
 
-  // ===== الاشتراك في تدفقات الصوت =====
-  const receiver = connection.receiver;
-  // ننتظر قليلاً للتأكد من أن المستقبل جاهز
-  await new Promise(resolve => setTimeout(resolve, 1000));
-
+  // الحصول على قائمة المستخدمين (غير البوت)
   const members = voiceChannel.members.filter(m => !m.user.bot);
   if (members.size === 0) {
     console.log('⚠️ لا يوجد أعضاء في الروم، سيتم إنهاء الاتصال.');
@@ -164,40 +188,31 @@ async function startRecording(guild, voiceChannel) {
   }
 
   const userIds = members.map(m => m.id);
-  const subscriptions = [];
+  console.log(`👤 عدد المستخدمين في الروم: ${userIds.length}`);
 
-  for (const userId of userIds) {
-    if (userId === client.user.id) continue;
-    try {
-      const audioStream = receiver.subscribe(userId, {
-        end: { behavior: EndBehaviorType.AfterSilence },
-      });
-      if (!audioStream) {
-        console.log(`⚠️ لا يمكن الاشتراك في صوت المستخدم ${userId}`);
-        continue;
-      }
-      const decoder = new prism.opus.Decoder({
-        rate: 48000,
-        channels: 2,
-        frameSize: 960,
-      });
-      const pipeline = audioStream.pipe(decoder).pipe(pcmStream);
-      subscriptions.push({ userId, audioStream, decoder, pipeline });
-      console.log(`✅ تم الاشتراك في صوت المستخدم ${userId}`);
-    } catch (err) {
-      console.error(`❌ فشل الاشتراك في المستخدم ${userId}:`, err.message);
-    }
-  }
+  // الاشتراك في الصوت
+  const receiver = connection.receiver;
+  // نعطي وقتاً للمستقبل ليكون جاهزاً
+  await new Promise(resolve => setTimeout(resolve, 1500));
+
+  const subscriptions = await subscribeToUsers(receiver, userIds, pcmStream, 3);
 
   if (subscriptions.length === 0) {
-    console.error('❌ لا توجد تدفقات صوتية، سيتم إنهاء التسجيل.');
+    console.error('❌ لم يتم الاشتراك في أي مستخدم. لن يتم التسجيل.');
     try { pcmStream.close(); } catch (e) {}
     try { connection.destroy(); } catch (e) {}
     connectingAttempt = false;
+    // إرسال تنبيه في قناة النصوص
+    const transcriptChannel = guild.channels.cache.get(TRANSCRIPT_CHANNEL_ID);
+    if (transcriptChannel?.isTextBased()) {
+      await transcriptChannel.send({
+        content: `⚠️ فشل البدء في التسجيل في <#${RECORDING_CHANNEL}>، لم يتم العثور على تدفقات صوتية. تأكد من أن البوت لديه الصلاحيات اللازمة.`
+      }).catch(() => {});
+    }
     return;
   }
 
-  // ===== متابعة الأعضاء الجدد =====
+  // متابعة الأعضاء الجدد
   const voiceStateUpdateHandler = (oldState, newState) => {
     if (newState.channelId === voiceChannel.id && oldState.channelId !== voiceChannel.id) {
       const userId = newState.id;
@@ -224,7 +239,7 @@ async function startRecording(guild, voiceChannel) {
 
   client.on(Events.VoiceStateUpdate, voiceStateUpdateHandler);
 
-  // ===== حفظ بيانات الجلسة =====
+  // حفظ بيانات الجلسة
   recordingData = {
     pcmPath,
     mp3Path,
@@ -238,13 +253,13 @@ async function startRecording(guild, voiceChannel) {
 
   isRecording = true;
   connectingAttempt = false;
-  console.log(`🎙️ بدأ التسجيل في الروم (${subscriptions.length} مستخدمين).`);
+  console.log(`🎙️ بدأ التسجيل (${subscriptions.length} مستخدمين).`);
 }
 
 // ===== إيقاف التسجيل وتحويل الصوت وإرساله =====
 async function stopAndSendRecording(guild) {
   if (!isRecording || !recordingData) {
-    console.log('⚠️ لا يوجد تسجيل نشط.');
+    console.log('⚠️ لا يوجد تسجيل نشط أو بيانات مفقودة.');
     return;
   }
 
@@ -259,10 +274,10 @@ async function stopAndSendRecording(guild) {
     listeners,
   } = recordingData;
 
-  // إلغاء الاشتراك من حدث VoiceStateUpdate
+  // إلغاء الاشتراك من الحدث
   client.off(Events.VoiceStateUpdate, voiceStateUpdateHandler);
 
-  // إغلاق جميع التدفقات
+  // إغلاق التدفقات
   for (const sub of subscriptions) {
     try { sub.audioStream.destroy(); } catch (e) {}
     try { sub.decoder.destroy(); } catch (e) {}
@@ -279,11 +294,12 @@ async function stopAndSendRecording(guild) {
       }
       connection.destroy();
     } catch (e) {
-      console.log('⚠️ فشل تدمير الاتصال (ربما دمر مسبقاً):', e.message);
+      console.log('⚠️ فشل تدمير الاتصال:', e.message);
     }
   }
 
   isRecording = false;
+  const data = recordingData;
   recordingData = null;
   connectingAttempt = false;
 
@@ -296,7 +312,7 @@ async function stopAndSendRecording(guild) {
     return;
   }
 
-  // تحويل PCM إلى MP3
+  // تحويل PCM → MP3
   console.log('🔄 جاري تحويل الصوت إلى MP3...');
   try {
     await new Promise((resolve, reject) => {
@@ -330,15 +346,16 @@ async function stopAndSendRecording(guild) {
   const secs = duration % 60;
   const durationText = mins > 0 ? `${mins} دقيقة و ${secs} ثانية` : `${secs} ثانية`;
 
-  // إرسال الملف
+  // إرسال الملف إلى قناة النصوص
   const transcriptChannel = guild.channels.cache.get(TRANSCRIPT_CHANNEL_ID);
-  if (transcriptChannel && transcriptChannel.isTextBased()) {
+  if (transcriptChannel?.isTextBased()) {
     const embed = new EmbedBuilder()
       .setColor(0x00ff88)
       .setTitle('🎙️ تسجيل مكالمة صوتية')
       .addFields(
         { name: 'المدة', value: durationText, inline: true },
         { name: 'الروم', value: `<#${RECORDING_CHANNEL}>`, inline: true },
+        { name: 'عدد المستخدمين', value: `${data.subscriptions.length}`, inline: true }
       )
       .setTimestamp();
 
@@ -386,7 +403,7 @@ client.once(Events.ClientReady, async (c) => {
   await cleanTempFiles();
 
   const voiceChannel = guild.channels.cache.get(RECORDING_CHANNEL);
-  if (voiceChannel && voiceChannel.type === 2) {
+  if (voiceChannel?.type === 2) {
     const members = voiceChannel.members.filter(m => !m.user.bot);
     if (members.size > 0 && !isRecording && !connectingAttempt) {
       await startRecording(guild, voiceChannel);
