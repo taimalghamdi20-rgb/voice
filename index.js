@@ -20,11 +20,11 @@ const fsSync = require('fs');
 const path = require('path');
 const ffmpeg = require('ffmpeg-static');
 
-// ===== قراءة المتغيرات البيئية =====
+// ===== قراءة المتغيرات البيئية (من Render) =====
 const {
   BOT_TOKEN,
   GUILD_ID,
-  RECORDING_CHANNEL,        // اسم المتغير كما في Render
+  RECORDING_CHANNEL,        // كما في الصورة
   TRANSCRIPT_CHANNEL_ID,
 } = process.env;
 
@@ -51,8 +51,8 @@ if (!fsSync.existsSync(TEMP_DIR)) {
 
 // ===== حالة البوت =====
 let isRecording = false;
-let connectingAttempt = false;    // منع المحاولات المتزامنة
-let recordingData = null;        // تخزين بيانات التسجيل
+let connectingAttempt = false;
+let recordingData = null;
 
 // ===== تنظيف الملفات المؤقتة =====
 async function cleanTempFiles() {
@@ -76,7 +76,7 @@ async function startRecording(guild, voiceChannel) {
 
   connectingAttempt = true;
 
-  // التأكد من عدم وجود اتصال مسبق في هذه القناة
+  // التأكد من عدم وجود اتصال مسبق
   const existingConnection = getVoiceConnection(guild.id);
   if (existingConnection) {
     console.log('⚠️ يوجد اتصال صوتي مسبق، سيتم تدميره.');
@@ -95,12 +95,15 @@ async function startRecording(guild, voiceChannel) {
     selfMute: true,
   });
 
-  // معالجة أحداث الاتصال
-  connection.on('error', (error) => {
-    console.error('🔴 خطأ في الاتصال الصوتي:', error);
-  });
+  // ===== رفع حد المستمعين لمنع التحذير =====
+  connection.setMaxListeners(20);
 
-  connection.on(VoiceConnectionStatus.Disconnected, async () => {
+  // ===== تعريف مستمعي الأحداث =====
+  const onError = (error) => {
+    console.error('🔴 خطأ في الاتصال الصوتي:', error);
+  };
+
+  const onDisconnected = async () => {
     console.log('🔌 انقطع الاتصال، جاري إعادة المحاولة...');
     try {
       await entersState(connection, VoiceConnectionStatus.Connecting, 5000);
@@ -108,21 +111,23 @@ async function startRecording(guild, voiceChannel) {
       console.log('❌ فشل إعادة الاتصال، سيتم تدمير الاتصال.');
       try { connection.destroy(); } catch (e) {}
     }
-  });
+  };
+
+  connection.on('error', onError);
+  connection.on(VoiceConnectionStatus.Disconnected, onDisconnected);
 
   try {
-    // انتظار جاهزية الاتصال (مهلة 30 ثانية)
     await entersState(connection, VoiceConnectionStatus.Ready, 30_000);
     console.log(`✅ متصل بالروم: ${voiceChannel.name}`);
   } catch (err) {
     console.error('❌ فشل الاتصال:', err.message);
-    // التدمير فقط إذا كان الاتصال لا يزال موجوداً ولم يتم تدميره
+    // إزالة المستمعين قبل التدمير
+    try {
+      connection.off('error', onError);
+      connection.off(VoiceConnectionStatus.Disconnected, onDisconnected);
+    } catch (e) {}
     if (connection && connection.state.status !== VoiceConnectionStatus.Destroyed) {
-      try {
-        connection.destroy();
-      } catch (e) {
-        console.log('⚠️ فشل تدمير الاتصال (ربما دمر مسبقاً):', e.message);
-      }
+      try { connection.destroy(); } catch (e) {}
     }
     connectingAttempt = false;
     return;
@@ -140,12 +145,11 @@ async function startRecording(guild, voiceChannel) {
   const subscriptions = [];
 
   for (const userId of userIds) {
-    if (userId === client.user.id) continue; // نتجنب تسجيل البوت نفسه
+    if (userId === client.user.id) continue;
     const audioStream = receiver.subscribe(userId, {
       end: { behavior: EndBehaviorType.AfterSilence },
     });
     if (!audioStream) continue;
-
     const decoder = new prism.opus.Decoder({
       rate: 48000,
       channels: 2,
@@ -155,18 +159,16 @@ async function startRecording(guild, voiceChannel) {
     subscriptions.push({ userId, audioStream, decoder, pipeline });
   }
 
-  // ===== الاستماع للأعضاء الجدد الذين يدخلون أثناء التسجيل =====
+  // ===== متابعة الأعضاء الجدد =====
   const voiceStateUpdateHandler = (oldState, newState) => {
     if (newState.channelId === voiceChannel.id && oldState.channelId !== voiceChannel.id) {
       const userId = newState.id;
       if (userId === client.user.id) return;
       if (subscriptions.some(s => s.userId === userId)) return;
-
       const audioStream = receiver.subscribe(userId, {
         end: { behavior: EndBehaviorType.AfterSilence },
       });
       if (!audioStream) return;
-
       const decoder = new prism.opus.Decoder({
         rate: 48000,
         channels: 2,
@@ -189,6 +191,7 @@ async function startRecording(guild, voiceChannel) {
     connection,
     voiceStateUpdateHandler,
     startTime: Date.now(),
+    listeners: { onError, onDisconnected },  // لحذفهم لاحقاً
   };
 
   isRecording = true;
@@ -211,6 +214,7 @@ async function stopAndSendRecording(guild) {
     connection,
     voiceStateUpdateHandler,
     startTime,
+    listeners,
   } = recordingData;
 
   // إلغاء الاشتراك من حدث VoiceStateUpdate
@@ -224,9 +228,13 @@ async function stopAndSendRecording(guild) {
   }
   try { pcmStream.close(); } catch (e) {}
 
-  // تدمير الاتصال إذا كان موجوداً
+  // إزالة المستمعين ثم تدمير الاتصال
   if (connection && connection.state.status !== VoiceConnectionStatus.Destroyed) {
     try {
+      if (listeners) {
+        connection.off('error', listeners.onError);
+        connection.off(VoiceConnectionStatus.Disconnected, listeners.onDisconnected);
+      }
       connection.destroy();
     } catch (e) {
       console.log('⚠️ فشل تدمير الاتصال (ربما دمر مسبقاً):', e.message);
@@ -247,7 +255,7 @@ async function stopAndSendRecording(guild) {
     return;
   }
 
-  // ===== تحويل PCM إلى MP3 باستخدام ffmpeg =====
+  // ===== تحويل PCM → MP3 =====
   console.log('🔄 جاري تحويل الصوت إلى MP3...');
   try {
     await new Promise((resolve, reject) => {
@@ -273,7 +281,6 @@ async function stopAndSendRecording(guild) {
     return;
   }
 
-  // حذف ملف PCM
   await fs.unlink(pcmPath).catch(() => {});
 
   // ===== حساب المدة =====
@@ -317,7 +324,6 @@ client.on(Events.VoiceStateUpdate, async (oldState, newState) => {
   const voiceChannel = guild.channels.cache.get(RECORDING_CHANNEL);
   if (!voiceChannel || voiceChannel.type !== 2) return;
 
-  // التحقق من وجود بشر (غير البوت) في الروم
   const members = voiceChannel.members.filter(m => !m.user.bot);
   const hasHumans = members.size > 0;
 
